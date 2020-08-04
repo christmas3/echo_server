@@ -6,7 +6,7 @@
 
 #define C_RED "\33[1;31m"
 //#define C_GREEN     "\33[1;32m"
-#define C_YELLOW "\33[1;33m"b
+#define C_YELLOW "\33[1;33m"
 //#define C_BLUE      "\33[1;34m"
 //#define C_MAGENTA   "\33[1;35m"
 #define C_END "\33[0;39m"

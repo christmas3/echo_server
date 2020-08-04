@@ -1,7 +1,7 @@
-#include "debug.h"
 #include "echo_server.h"
+#include "debug.h"
 
-using namespace std;
+#include <signal.h>
 
 int main(int argc, char** argv)
 {
@@ -11,7 +11,11 @@ int main(int argc, char** argv)
         gflags::SetUsageMessage(EchoServer::destinyDescribe());
         gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-        EchoServer es{static_cast<std::uint16_t>(FLAGS_port)};
+        auto &&es = EchoServer::getEchoServer(FLAGS_ip_addr, static_cast<std::uint16_t>(FLAGS_port));
+        for (auto &&sig : EchoServer::signalsForStop()) {
+            signal(sig, &EchoServer::stopSignalHandler);
+        }
+        es.start();
 
     } catch (std::system_error &e) {
         ERR(e.what());
@@ -23,6 +27,6 @@ int main(int argc, char** argv)
         ret_code = 1;
     }
 
-    return ret_code;
+    exit(ret_code);
 }
 

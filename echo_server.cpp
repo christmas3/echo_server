@@ -42,53 +42,64 @@ struct EchoServer::himpl_
     himpl_(const std::string &ip_addr, uint16_t port);
     void startListen();
 
-    std::string ser_addr;
-    std::uint16_t ser_port;
+    std::string serv_ip;
+    std::uint16_t serv_port;
     sockaddr_in serv_addr;
     struct ev_loop *main_loop;
     const int family = AF_INET;
     ev::async stop_watcher;
-    const size_t MAX_READ = 4096;
+    static constexpr size_t MAX_READ = 4096;
 
 private:
     void initSockaddrIn_();
     void stop_(ev::async &w, int revents);
-    void accept_(ev::io &w, int revents);
-    void read_(ev::io &w, int revents);
+    static void accept_(ev::io &w, int revents);
+    static void read_(ev::io &w, int revents);
+    static void write_(ev::io &w, int revents);
     static std::uint32_t sinAddr_(int family, const std::string &ip_addr);
-    template<void (himpl_::*method)(ev::io &, int)>
+    template<void (*method)(ev::io &, int)>
     void addWatcher_(int fd, int revents, std::string &&data = "")
     {
-        l_io_watchers_.emplace_back(main_loop, std::move(data));
-        auto &iw = l_io_watchers_.back().io_watcher;
+        l_io_watchers_.push_back(pIoDataWatcher(new IoDataWatcher_(main_loop, std::move(data))));
+        auto &iw = l_io_watchers_.back()->io_watcher;
         iw.set(fd, revents);
-        iw.set<himpl_, method>(this);
+        iw.set<method>();
+        iw.data = this;
         iw.start();
     }
-    void deleteWatcher_(int fd);
 
     struct IoDataWatcher_
     {
-        IoDataWatcher_(EV_P_ std::string &&d) : io_watcher(loop), data(std::move(d)), port(0)
-        {
-            io_watcher.data = this;
-        }
+        IoDataWatcher_(EV_P_ std::string &&d) : io_watcher(loop), data(std::move(d)), port(0){}
         void setCliInfo(const sockaddr_in &cli_addr)
         {
             ip = inet_ntoa(cli_addr.sin_addr);
             port = ntohs(cli_addr.sin_port);
+        }
+        ~IoDataWatcher_()
+        {
+            NORM("~IoDataWatcher_");
+            io_watcher.stop();
+            if (close(io_watcher.fd)) {
+                ERR("Error while closing fd: " << strerror(errno));
+            }
         }
         ev::io io_watcher;
         std::string data;
         std::string ip;
         std::uint16_t port;
     };
+    using pIoDataWatcher = std::shared_ptr<IoDataWatcher_>;
 
-    std::list<IoDataWatcher_> l_io_watchers_;
+    std::list<pIoDataWatcher> l_io_watchers_;
+    using DataWatcherIter_ = std::list<pIoDataWatcher>::iterator;
+
+    DataWatcherIter_ dataWatcherIter_(int fd);
+    void deleteWatcher_(DataWatcherIter_ iter);
 };
 
 EchoServer::himpl_::himpl_(const std::string &ip_addr, uint16_t port)
-    : ser_addr(ip_addr), ser_port(port),
+    : serv_ip(ip_addr), serv_port(port),
       main_loop(EV_DEFAULT), stop_watcher(main_loop)
 {
     stop_watcher.set<himpl_, &himpl_::stop_>(this);
@@ -117,18 +128,12 @@ void EchoServer::himpl_::initSockaddrIn_()
 {
     bzero(&serv_addr, sizeof(serv_addr));
     serv_addr.sin_family = family;
-    serv_addr.sin_addr.s_addr = sinAddr_(family, ser_addr);
-    serv_addr.sin_port = htons(ser_port);
+    serv_addr.sin_addr.s_addr = sinAddr_(family, serv_ip);
+    serv_addr.sin_port = htons(serv_port);
 }
 
 void EchoServer::himpl_::stop_(ev::async &w, int)
 {
-    for(auto&& data_watcher : l_io_watchers_){
-        if (close(data_watcher.io_watcher.fd)) {
-            ERR("Error while closing fd: " << strerror(errno));
-        }
-        data_watcher.io_watcher.stop();
-    }
     l_io_watchers_.clear();
     w.stop();
     ev_break(w.loop);
@@ -151,8 +156,11 @@ void EchoServer::himpl_::accept_(ev::io &w, int)
             EchoServer::getEchoServer().stop();
         }
         try {
-            addWatcher_<&himpl_::read_>(cli_fd, ev::READ);
-            l_io_watchers_.back().setCliInfo(cli_addr);
+            auto *p_himpl = static_cast<himpl_*>(w.data);
+            p_himpl->addWatcher_<&himpl_::read_>(cli_fd, ev::READ);
+            auto& data_watch = p_himpl->l_io_watchers_.back();
+            data_watch->setCliInfo(cli_addr);
+            DONE("Connected client ip = " << data_watch->ip << " port = " << data_watch->port);
         } catch (std::exception &e) {
             ERR(e.what());
             close(cli_fd);
@@ -161,10 +169,12 @@ void EchoServer::himpl_::accept_(ev::io &w, int)
     }
 }
 
-void EchoServer::himpl_::read_(ev::io &w, int revents)
+void EchoServer::himpl_::read_(ev::io &w, int)
 {
     char buf[MAX_READ];
     ssize_t readed = 0;
+    auto *p_himpl = static_cast<himpl_ *>(w.data);
+    auto watcher_iter = p_himpl->dataWatcherIter_(w.fd);
     while (readed <= 0) {
         auto &&readed = read(w.fd, buf, MAX_READ);
         if (readed < 0) {
@@ -177,11 +187,23 @@ void EchoServer::himpl_::read_(ev::io &w, int revents)
             }
         }
         else if(readed == 0){
-
+            WARN("Client disconnected ip = " << (*watcher_iter)->ip
+                                             << " port = " << (*watcher_iter)->port);
+            p_himpl->deleteWatcher_(watcher_iter);
+            break;
+        } else {
+            std::string data(buf, readed);
+            NORM("Readed from client ip = " << (*watcher_iter)->ip << " port = " << (*watcher_iter)->port
+                                            << " data = " << data);
         }
     }
 
 }
+
+//void EchoServer::himpl_::write_(ev::io &w, int revents)
+//{
+
+//}
 
 uint32_t EchoServer::himpl_::sinAddr_(int family, const std::string &ip_addr)
 {
@@ -199,14 +221,22 @@ uint32_t EchoServer::himpl_::sinAddr_(int family, const std::string &ip_addr)
     return in_ip.s_addr;
 }
 
-void EchoServer::himpl_::deleteWatcher_(int fd)
+void EchoServer::himpl_::deleteWatcher_(DataWatcherIter_ iter)
 {
-    auto &&l_iter = std::find_if(l_io_watchers_.begin(),
-                                 l_io_watchers_.end(),
-                                 [fd](const auto &data_wather) {
-                                     return data_wather.io_watcher.fd == fd;
-                                 });
+    if (iter != l_io_watchers_.end()) {
+        l_io_watchers_.erase(iter);
+    } else {
+        ERR("Cannot find IoDataWatcher");
+    }
+}
 
+EchoServer::himpl_::DataWatcherIter_ EchoServer::himpl_::dataWatcherIter_(int fd)
+{
+    return std::find_if(l_io_watchers_.begin(),
+                        l_io_watchers_.end(),
+                        [fd](const auto &data_watcher) {
+                            return data_watcher->io_watcher.fd == fd;
+                        });
 }
 
 EchoServer::EchoServer(const std::string &ip_addr, uint16_t port)
@@ -227,7 +257,7 @@ EchoServer::~EchoServer()
 void EchoServer::start()
 {
     up_himpl_->startListen();
-    NORM("Echo server on " << up_himpl_->ser_addr << ":" << up_himpl_->ser_port << " started");
+    NORM("Echo server on " << up_himpl_->serv_ip << ":" << up_himpl_->serv_port << " started");
     ev_run(up_himpl_->main_loop);
 }
 

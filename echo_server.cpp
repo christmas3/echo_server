@@ -44,24 +44,51 @@ struct EchoServer::himpl_
 
     std::string ser_addr;
     std::uint16_t ser_port;
-    int listen_fd;
     sockaddr_in serv_addr;
     struct ev_loop *main_loop;
     const int family = AF_INET;
     ev::async stop_watcher;
-    std::list<ev::io> l_io_watchers;
+    const size_t MAX_READ = 4096;
 
 private:
     void initSockaddrIn_();
     void stop_(ev::async &w, int revents);
     void accept_(ev::io &w, int revents);
+    void read_(ev::io &w, int revents);
     static std::uint32_t sinAddr_(int family, const std::string &ip_addr);
-    typedef void (himpl_::*IoCb_)(ev::io &, int);
-    void addListenWatcher_(int fd, int revents);
+    template<void (himpl_::*method)(ev::io &, int)>
+    void addWatcher_(int fd, int revents, std::string &&data = "")
+    {
+        l_io_watchers_.emplace_back(main_loop, std::move(data));
+        auto &iw = l_io_watchers_.back().io_watcher;
+        iw.set(fd, revents);
+        iw.set<himpl_, method>(this);
+        iw.start();
+    }
+    void deleteWatcher_(int fd);
+
+    struct IoDataWatcher_
+    {
+        IoDataWatcher_(EV_P_ std::string &&d) : io_watcher(loop), data(std::move(d)), port(0)
+        {
+            io_watcher.data = this;
+        }
+        void setCliInfo(const sockaddr_in &cli_addr)
+        {
+            ip = inet_ntoa(cli_addr.sin_addr);
+            port = ntohs(cli_addr.sin_port);
+        }
+        ev::io io_watcher;
+        std::string data;
+        std::string ip;
+        std::uint16_t port;
+    };
+
+    std::list<IoDataWatcher_> l_io_watchers_;
 };
 
 EchoServer::himpl_::himpl_(const std::string &ip_addr, uint16_t port)
-    : ser_addr(ip_addr), ser_port(port), listen_fd{0},
+    : ser_addr(ip_addr), ser_port(port),
       main_loop(EV_DEFAULT), stop_watcher(main_loop)
 {
     stop_watcher.set<himpl_, &himpl_::stop_>(this);
@@ -70,7 +97,7 @@ EchoServer::himpl_::himpl_(const std::string &ip_addr, uint16_t port)
 
 void EchoServer::himpl_::startListen()
 {
-    listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         THROW_SYS_ERR("Error call socket");
     }
@@ -83,7 +110,7 @@ void EchoServer::himpl_::startListen()
     if (res != 0) {
         THROW_SYS_ERR("Error call listen");
     }
-    addListenWatcher_(listen_fd, ev::READ);
+    addWatcher_<&himpl_::accept_>(listen_fd, ev::READ);
 }
 
 void EchoServer::himpl_::initSockaddrIn_()
@@ -96,21 +123,64 @@ void EchoServer::himpl_::initSockaddrIn_()
 
 void EchoServer::himpl_::stop_(ev::async &w, int)
 {
-    for (auto &&w_io : l_io_watchers) {
-        w_io.stop();
-        if (close(w_io.fd)) {
+    for(auto&& data_watcher : l_io_watchers_){
+        if (close(data_watcher.io_watcher.fd)) {
             ERR("Error while closing fd: " << strerror(errno));
         }
+        data_watcher.io_watcher.stop();
     }
-    l_io_watchers.clear();
+    l_io_watchers_.clear();
     w.stop();
     ev_break(w.loop);
     NORM("Echo server stoped");
 }
 
-void EchoServer::himpl_::accept_(ev::io &w, int revents)
+void EchoServer::himpl_::accept_(ev::io &w, int)
 {
-    NORM("accept !!!!");
+    sockaddr_in cli_addr;
+    socklen_t cli_len = sizeof(cli_addr);
+    int cli_fd = 0;
+    while (cli_fd <= 0) {
+        cli_fd = accept(w.fd, (sockaddr *) &cli_addr, &cli_len);
+        if (cli_fd < 0) {
+            if (errno == EINTR) {
+                WARN("accept interrupted by system signal");
+                continue;
+            }
+            ERR("Error accept call: " << strerror(errno));
+            EchoServer::getEchoServer().stop();
+        }
+        try {
+            addWatcher_<&himpl_::read_>(cli_fd, ev::READ);
+            l_io_watchers_.back().setCliInfo(cli_addr);
+        } catch (std::exception &e) {
+            ERR(e.what());
+            close(cli_fd);
+            break;
+        }
+    }
+}
+
+void EchoServer::himpl_::read_(ev::io &w, int revents)
+{
+    char buf[MAX_READ];
+    ssize_t readed = 0;
+    while (readed <= 0) {
+        auto &&readed = read(w.fd, buf, MAX_READ);
+        if (readed < 0) {
+            if (errno == EINTR) {
+                WARN("read interrupt by system signal");
+                continue;
+            } else {
+                ERR("Error readed from fd: " << strerror(errno));
+                break;
+            }
+        }
+        else if(readed == 0){
+
+        }
+    }
+
 }
 
 uint32_t EchoServer::himpl_::sinAddr_(int family, const std::string &ip_addr)
@@ -129,16 +199,19 @@ uint32_t EchoServer::himpl_::sinAddr_(int family, const std::string &ip_addr)
     return in_ip.s_addr;
 }
 
-void EchoServer::himpl_::addListenWatcher_(int fd, int revents)
+void EchoServer::himpl_::deleteWatcher_(int fd)
 {
-    l_io_watchers.emplace_back(main_loop);
-    l_io_watchers.back().set(fd, revents);
-    l_io_watchers.back().set<himpl_,&himpl_::accept_>(this);
-    l_io_watchers.back().start();
+    auto &&l_iter = std::find_if(l_io_watchers_.begin(),
+                                 l_io_watchers_.end(),
+                                 [fd](const auto &data_wather) {
+                                     return data_wather.io_watcher.fd == fd;
+                                 });
+
 }
 
 EchoServer::EchoServer(const std::string &ip_addr, uint16_t port)
-    : up_himpl_{new himpl_{ip_addr, port}} {}
+    : up_himpl_{new himpl_{ip_addr, port}}
+{}
 
 EchoServer& EchoServer::getEchoServer(const std::string &ip_addr, uint16_t port)
 {

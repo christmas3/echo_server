@@ -1,3 +1,5 @@
 /CMakeFiles/
 *.user
 *.cmake
+/.idea/
+/cmake-build-debug/

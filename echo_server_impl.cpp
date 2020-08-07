@@ -4,6 +4,7 @@
 #include "watchers.h"
 
 #include <algorithm>
+#include <fcntl.h>
 
 void EchoServerImpl::start()
 {
@@ -19,6 +20,9 @@ void EchoServerImpl::start()
     res = listen(listen_fd, 10);
     if (res != 0) {
         THROW_SYS_ERR("Error call listen");
+    }
+    if(!setNonBlock_(listen_fd)){
+        throw std::logic_error("");
     }
     s_io_watchers_.insert(
         DataIoWatcher::create<&EchoServerImpl::accept_>(main_loop_, listen_fd, ev::READ, this, ""));
@@ -47,9 +51,9 @@ std::string &EchoServerImpl::portParamDescribe()
     return descr;
 }
 
-EchoServerImpl::DataIoWatcherIter_ EchoServerImpl::findDataWatcherIter_(int fd, int events)
+EchoServerImpl::DataIoWatcherIter_ EchoServerImpl::findDataWatcherIter_(int fd)
 {
-    return s_io_watchers_.find(DataIoFd{fd, events});
+    return s_io_watchers_.find(DataIoFd{fd});
 }
 
 void EchoServerImpl::deleteWatcher_(EchoServerImpl::DataIoWatcherIter_ iter)
@@ -60,7 +64,7 @@ void EchoServerImpl::deleteWatcher_(EchoServerImpl::DataIoWatcherIter_ iter)
     else {
         ERR("Cannot find IoDataWatcher");
     }
-//    printConnectionCount_();
+    printConnectionCount_();
 }
 
 void EchoServerImpl::initStopWatcher_()
@@ -114,12 +118,16 @@ void EchoServerImpl::accept_(ev::io &w, int)
                 WARN("accept interrupted by system signal");
                 continue;
             }
+            if(errno == EWOULDBLOCK){
+                WARN("accept would block");
+                break;
+            }
             ERR("Error accept call: " << strerror(errno));
             EchoServer::getEchoServer().stop();
         }
         try {
             auto *p_himpl = serverImpl(w);
-            auto sp_data_watcher = DataIoWatcher::create<&EchoServerImpl::read_>(p_himpl->main_loop_,
+            auto sp_data_watcher = DataIoWatcher::create<&EchoServerImpl::read_write_>(p_himpl->main_loop_,
                                                                                  cli_fd,
                                                                                  ev::READ,
                                                                                  p_himpl,
@@ -128,7 +136,7 @@ void EchoServerImpl::accept_(ev::io &w, int)
             p_himpl->s_io_watchers_.insert(sp_data_watcher);
             DONE("Connected client = " << sp_data_watcher->ipCli() << ":"
                                        << sp_data_watcher->portCli());
-//            p_himpl->printConnectionCount_();
+            p_himpl->printConnectionCount_();
         }
         catch (std::exception &e) {
             ERR(e.what());
@@ -138,45 +146,50 @@ void EchoServerImpl::accept_(ev::io &w, int)
     }
 }
 
-void EchoServerImpl::read_(ev::io &w, int)
+void EchoServerImpl::read_write_(ev::io &w, int revents)
 {
     try {
-        auto *p_himpl = serverImpl(w);
-        char buf[p_himpl->MAX_READ_];
-        auto try_read{0};
-        auto watcher_iter = p_himpl->findDataWatcherIter_(w.fd, ev::READ);
-        while (try_read++ < 3) {
-            auto &&readed = read(w.fd, buf, p_himpl->MAX_READ_);
-            if (readed < 0) {
-                if (errno == EINTR) {
-                    WARN("read interrupt by system signal");
-                    continue;
+        if (revents & ev::WRITE) {
+            write_(w, revents);
+        }
+        else {
+            auto *p_himpl = serverImpl(w);
+            std::vector<char> v_buf(p_himpl->MAX_READ_);
+            auto try_read{0};
+            auto watcher_iter = p_himpl->findDataWatcherIter_(w.fd);
+            while (try_read++ < 3) {
+                auto &&readed = read(w.fd, v_buf.data(), v_buf.size());
+                if (readed < 0) {
+                    if (errno == EINTR) {
+                        WARN("read interrupt by system signal");
+                        continue;
+                    }
+                    if (errno == EWOULDBLOCK) {
+                        WARN("read would block");
+                    }
+                    else {
+                        ERR("Error readed from fd: " << strerror(errno));
+                        p_himpl->deleteWatcher_(watcher_iter);
+                    }
                 }
-                else {
-                    ERR("Error readed from fd: " << strerror(errno));
+                else if (readed == 0) {
+                    WARN("Client disconnected = " << (*watcher_iter)->cliInfo());
                     p_himpl->deleteWatcher_(watcher_iter);
                 }
+                else {
+                    NORM("Readed from " << (*watcher_iter)->cliInfo() << " " << readed << " bytes");
+                    (*watcher_iter)->addData(std::string(v_buf.data(), readed));
+                }
+                break;
             }
-            else if (readed == 0) {
-                WARN("Client disconnected = " << (*watcher_iter)->cliInfo());
-                p_himpl->deleteWatcher_(watcher_iter);
+            if (try_read == 3) {
+                ERR("Error while reading from clien = " << (*watcher_iter)->cliInfo());
             }
-            else {
-                p_himpl->s_io_watchers_.insert(
-                    DataIoWatcher::create<&EchoServerImpl::write_>(p_himpl->main_loop_,
-                                                                   w.fd,
-                                                                   ev::WRITE,
-                                                                   p_himpl,
-                                                                   std::string(buf, readed)));
-            }
-            break;
-        }
-        if (try_read == 3) {
-            ERR("Error while reading from clien = " << (*watcher_iter)->cliInfo());
         }
     }
-    catch (std::exception &e) {
-        ERR("Error while read from fd: " << e.what());
+    catch (std::exception & e)
+    {
+        ERR("Error while read_write from fd: " << e.what());
     }
 }
 
@@ -184,21 +197,21 @@ void EchoServerImpl::write_(ev::io &w, int)
 {
     try {
         auto *p_himpl = serverImpl(w);
-        auto &&data_watcher_iter = p_himpl->findDataWatcherIter_(w.fd, ev::WRITE);
-        writeTo_(w.fd, (*data_watcher_iter)->data());
-        p_himpl->deleteWatcher_(data_watcher_iter);
+        auto &&data_watcher_iter = p_himpl->findDataWatcherIter_(w.fd);
+        auto&& written = writeTo_(w.fd, (*data_watcher_iter)->data());
+        (*data_watcher_iter)->addSended(written);
     }
     catch (std::exception &e) {
         ERR("Error while write in fd: " << e.what());
     }
 }
-void EchoServerImpl::writeTo_(int fd, const std::string &data)
+std::uint32_t EchoServerImpl::writeTo_(int fd, const std::string &data)
 {
     size_t len_to_write = data.size();
     const char *cur_pos = data.c_str();
     while (len_to_write > 0) {
-        auto &&writed = write(fd, cur_pos, len_to_write);
-        if (writed < 0) {
+        auto &&written = write(fd, cur_pos, len_to_write);
+        if (written < 0) {
             if (errno == EINTR) {
                 WARN("write interruped by system signal");
                 continue;
@@ -208,16 +221,26 @@ void EchoServerImpl::writeTo_(int fd, const std::string &data)
                 break;
             }
         }
-        len_to_write -= writed;
-        cur_pos += writed;
+        len_to_write -= written;
+        cur_pos += written;
     }
+    return data.size() - len_to_write;
 }
 void EchoServerImpl::printConnectionCount_() const noexcept
 {
-    auto&& count = std::count_if(s_io_watchers_.begin(), s_io_watchers_.end(), [](const auto& sp_watcher)
-    {
-        return sp_watcher->events() == ev::READ;
-    });
-    NORM("Connections number = " << --count);
+    NORM("Connections number = " << s_io_watchers_.size()-1);
+}
+bool EchoServerImpl::setNonBlock_(int fd)
+{
+    auto cur_flags = fcntl(fd, F_GETFL, 0);
+    if(cur_flags < 0){
+        ERR("Error while getting fd flags: " << strerror(errno));
+        return false;
+    }
+    if(fcntl(fd, F_SETFL, cur_flags | O_NONBLOCK) < 0){
+        ERR("Error while setting nonblock flag in fd: " << strerror(errno));
+        return false;
+    }
+    return true;
 }
 

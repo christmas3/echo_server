@@ -19,7 +19,6 @@ int main(int argc, char** argv)
 
     } catch (std::system_error &e) {
         ERR(e.what());
-//        ERR(e.what() << " errno: " << debug_func::errnoDescribe(e.code().value()));
         ret_code = e.code().value();
     }
     catch (std::exception &e) {

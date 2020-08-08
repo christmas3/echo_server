@@ -2,7 +2,7 @@
 
 print_help()
 {
-    echo "Usage: single_send_cli.sh ip port client_count send_size [delay]"
+    echo "Usage: single_send_cli.sh ip port send_size send_count delay"
 }
 
 check_nc()
@@ -16,28 +16,24 @@ check_nc()
 send_text()
 {
     local send_size_="$1"
-    cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w $send_size_ | head -n 1
+    local send_count_="$2"
+    local delay_="$3"
+    cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w $send_size_ | head -n $send_count_ | while read -r line ; do echo "$line"; sleep $delay_; done
 }
 
-serv_ip="$1"
-serv_port="$2"
-client_count="$3"
-send_size="$4"
-delay="$5"
-
-if [ $# -lt 4 ]; then
+if [ $# -lt 5 ]; then
     print_help
     exit 1
 fi
 
+serv_ip="$1"
+serv_port="$2"
+send_size="$3"
+send_count="$4"
+delay="$5"
+
 check_nc
 
-while [ $client_count -gt 0 ]; do
-    for_send="$(send_text $send_size)"
-    echo -e "\n$client_count : $for_send"
-    echo "$for_send" | nc -W 1 $serv_ip $serv_port
-    client_count=$((client_count - 1))
-    # if [ -n "$delay" ]; then
-    #     sleep $delay
-    # fi
-done
+send_text $send_size $send_count $delay | nc -N $serv_ip $serv_port
+
+

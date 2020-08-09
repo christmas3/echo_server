@@ -34,12 +34,12 @@ For writing debug into stderr use -logtostderr flag, otherwise log will be writi
 # Testing
 ```shell
 cd tests
-./multi_send_cli.sh <ip> <port> <cli_count> <send_size> <send_count> <delay>
+./multi_send_cli.sh <ip_serv> <port_serv> <cli_count> <send_size> <send_count> <send_delay>
 ```
 
 
-run <cli_count> numbers of nc commands in background which connect to the server by <ip> and <port>
-and send random alphabet sequence <send_size> length <send_count> times with <delay> between every send
+run <cli_count> numbers of nc commands in background which connect to the server by <ip_serv>:<port_serv>
+and send random alphabet sequence <send_size> length, <send_count> times with <send_delay> between every send
 
 # Docker
 ```shell
